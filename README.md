@@ -95,7 +95,7 @@ Every function and major calculation in `scripts/valuation_dcf.py` includes deta
 - Discounting logic (present value calculation)
 - Sensitivity table construction (two-way sensitivity and interpretation)
 
-**Interview-ready**: Read the comments and code; you'll be able to explain every step without notes.
+**Interview-ready**: NOTE - Read the comments and code to help revise and explain steps 
 
 ## Limitations & discussion points
 
