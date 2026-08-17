@@ -173,12 +173,20 @@ def build_history_metrics(income: pd.DataFrame, balance: pd.DataFrame, cashflow:
 def build_ufcf_projection(hist: pd.DataFrame, years: int = 5) -> pd.DataFrame:
     """Project unlevered free cash flow for five years.
 
-    The logic is:
-    EBIT x (1 - tax rate) = NOPAT
-    + depreciation = non-cash expense added back
-    - capex = cash reinvestment needed to maintain the asset base
-    - change in net working capital = cash tied up in the business
-    = UFCF
+    UNLEVERED FREE CASH FLOW (UFCF):
+    UFCF is the cash available to both debt and equity holders before any financing decisions.
+    It represents the true economic cash generation of the business.
+
+    The formula:
+    NOPAT = EBIT × (1 - tax rate)  [operating profit after tax, before financing]
+    + Depreciation & Amortization  [non-cash charge added back]
+    - Capital Expenditures         [cash spent on equipment, property, etc.]
+    - Change in Net Working Capital [cash tied up in receivables, inventory, payables]
+    ___________________________________________________________________________________________
+    = UFCF                         [free cash available to all capital providers]
+
+    We project this forward 5 years using historical margins to get the explicit forecast period.
+    Beyond year 5, we estimate a terminal value (perpetual growth).
     """
     latest_year = hist.iloc[-1]
     revenue_growth = (latest_year["Revenue"] / hist["Revenue"].iloc[0]) ** (1 / max(len(hist) - 1, 1)) - 1
@@ -199,16 +207,31 @@ def build_ufcf_projection(hist: pd.DataFrame, years: int = 5) -> pd.DataFrame:
         "Year": np.arange(1, years + 1),
         "Revenue": revenue_forecast,
     })
+    # Operating profit scaled by revenue growth; apply historical EBIT margin
     forecast["EBIT"] = forecast["Revenue"] * ebit_margin
     forecast["Tax Rate"] = tax_rate
+    
+    # NOPAT: Net Operating Profit After Tax. This is EBIT after accounting for cash taxes.
+    # It represents profit available to all capital providers (before financing).
     forecast["NOPAT"] = forecast["EBIT"] * (1 - forecast["Tax Rate"])
+    
+    # D&A: Depreciation & Amortization. Non-cash charges that reduce accounting profit
+    # but don't affect cash, so we add them back to get true economic cash generation.
     forecast["D&A"] = forecast["Revenue"] * d_and_a_margin
+    
+    # Capex: Capital expenditures needed to maintain and grow the asset base.
+    # This is a true cash outflow that reduces free cash flow.
     forecast["Capex"] = forecast["Revenue"] * capex_margin
+    
+    # Net Working Capital: cash tied up in day-to-day operations (receivables, inventory minus payables).
     forecast["NWC"] = forecast["Revenue"] * nwc_margin
 
-    # We calculate the change in NWC year-over-year. This captures the cash the
-    # business needs to keep tied up in operations.
+    # Delta NWC: year-over-year change in working capital. If NWC increases, the company
+    # must invest cash; if it decreases, the company frees up cash.
     forecast["Delta NWC"] = forecast["NWC"].diff().fillna(0.0)
+    
+    # UFCF = NOPAT + D&A - Capex - Delta NWC
+    # This is the cash available each year to both debt and equity holders.
     forecast["UFCF"] = (
         forecast["NOPAT"]
         + forecast["D&A"]
@@ -222,9 +245,15 @@ def build_ufcf_projection(hist: pd.DataFrame, years: int = 5) -> pd.DataFrame:
 def estimate_cost_of_debt(balance: pd.DataFrame, income: pd.DataFrame) -> float:
     """Estimate the after-tax cost of debt from actual interest burden.
 
-    Cost of debt is approximated as interest expense divided by average debt, then
-    adjusted by the tax shield. This is a workable debt proxy when market debt
-    yields are not available.
+    COST OF DEBT (Rd):
+    The cost of debt is the effective interest rate the company pays on its outstanding
+    debt. We estimate this as:
+    - Pre-tax cost of debt = annual interest expense / total debt outstanding
+    - After-tax cost of debt = pre-tax cost * (1 - tax rate)
+    The tax adjustment reflects the fact that interest is tax-deductible, giving the
+    company a tax shield. A 5% cost of debt at a 25% tax rate is only 3.75% after-tax.
+
+    This is a workable proxy when market debt yields are not available.
     """
     interest_key = pick_metric(income, ["Interest Expense", "Interest And Debt Expense", "Interest Expense Net"])
     debt_key = pick_metric(balance, ["Total Debt", "Short Long Term Debt", "Long Term Debt", "Current Debt"])
@@ -238,6 +267,8 @@ def estimate_cost_of_debt(balance: pd.DataFrame, income: pd.DataFrame) -> float:
         return 0.052
 
     tax_rate = robust_tax_rate(income)
+    # Pre-tax cost is raw interest burden; multiply by (1 - tax_rate) to get the after-tax cost
+    # that represents the true economic cost to equity holders (debt is cheaper because interest is deductible).
     pre_tax_cost_debt = latest_interest / latest_debt if latest_debt > 0 else 0.06
     return float(pre_tax_cost_debt * (1 - tax_rate))
 
@@ -245,8 +276,27 @@ def estimate_cost_of_debt(balance: pd.DataFrame, income: pd.DataFrame) -> float:
 def estimate_capm_wacc(info: Dict, balance: pd.DataFrame, income: pd.DataFrame) -> Dict[str, float]:
     """Estimate WACC using CAPM for cost of equity and book debt weights.
 
-    WACC is the blended required return for all capital providers:
-    WACC = E/V * Re + D/V * Rd * (1 - tax rate)
+    WEIGHTED AVERAGE COST OF CAPITAL (WACC):
+    WACC is the discount rate used to value a company's unlevered cash flows. It represents
+    the blended required return that all capital providers (debt holders and equity investors)
+    expect to earn on their investment in the company.
+
+    Formula: WACC = (E/V) * Re + (D/V) * Rd * (1 - Tc)
+
+    Where:
+    - E/V = weight of equity in capital structure (market cap / total value)
+    - Re = cost of equity, estimated via CAPM
+    - D/V = weight of debt in capital structure (total debt / total value)
+    - Rd = cost of debt (interest rate)
+    - Tc = corporate tax rate
+
+    CAPM (Capital Asset Pricing Model) for cost of equity:
+    Re = Rf + β * (Rm - Rf)
+    - Rf = risk-free rate (~4.2% US 10-year Treasury)
+    - β = beta (stock volatility relative to market; β=1 means market-level volatility)
+    - (Rm - Rf) = equity risk premium (~5% typical assumption)
+    
+    For Varex, beta < 1 means the stock is less volatile than the overall market.
     """
     market_cap = float(info.get("marketCap", 0.0) or 0.0)
     shares = float(info.get("sharesOutstanding", 0.0) or 0.0)
@@ -260,9 +310,10 @@ def estimate_capm_wacc(info: Dict, balance: pd.DataFrame, income: pd.DataFrame) 
     if debt <= 0:
         debt = 0.0
 
-    beta = float(info.get("beta", 1.2) or 1.2)
-    risk_free = 0.042  # Approximate 10-year US Treasury yield.
-    market_risk_premium = 0.05
+    beta = float(info.get("beta", 1.2) or 1.2)  # Actual beta from yfinance; <1 = less volatile than market
+    risk_free = 0.042  # Approximate 10-year US Treasury yield as of Aug 2026.
+    market_risk_premium = 0.05  # Historical equity risk premium over risk-free rate.
+    # CAPM: cost of equity = risk-free + (sensitivity to market * market premium)
     cost_of_equity = risk_free + beta * market_risk_premium
 
     cost_of_debt = estimate_cost_of_debt(balance, income)
@@ -274,9 +325,12 @@ def estimate_capm_wacc(info: Dict, balance: pd.DataFrame, income: pd.DataFrame) 
         weight_equity = 0.7
         weight_debt = 0.3
     else:
+        # Capital structure weights: how much of the firm is financed by equity vs. debt
         weight_equity = market_cap / total_capital
         weight_debt = debt / total_capital
 
+    # WACC is the weighted blend of cost of equity and after-tax cost of debt.
+    # Higher WACC = higher risk = lower intrinsic value.
     wacc = weight_equity * cost_of_equity + weight_debt * cost_of_debt * (1 - tax_rate)
 
     return {
@@ -295,11 +349,22 @@ def estimate_capm_wacc(info: Dict, balance: pd.DataFrame, income: pd.DataFrame) 
 def discount_cash_flows(ufcf: pd.DataFrame, wacc: float) -> pd.DataFrame:
     """Discount explicit forecast cash flows back to present value.
 
-    Each projected year is discounted by (1 + WACC)^t. This converts future
-    value into today's dollars using the firm's required return.
+    PRESENT VALUE AND DISCOUNTING:
+    A dollar today is worth more than a dollar in the future because you can invest it.
+    We discount future cash flows by dividing by (1 + WACC)^t, where t is years in the future.
+
+    Formula: PV = CF_t / (1 + WACC)^t
+
+    For example, if WACC is 7% and we expect $100 million in year 3:
+    PV = $100M / (1.07^3) = $100M / 1.225 ≈ $81.6M today
+
+    The higher the WACC (more risky firm), the more we discount future cash flows,
+    resulting in a lower present value.
     """
     df = ufcf.copy()
+    # Calculate the discount factor for each year: (1 + WACC)^year
     df["PV Factor"] = (1 + wacc) ** df["Year"]
+    # Divide future cash flow by the discount factor to get present value
     df["PV UFCF"] = df["UFCF"] / df["PV Factor"]
     return df
 
@@ -307,13 +372,32 @@ def discount_cash_flows(ufcf: pd.DataFrame, wacc: float) -> pd.DataFrame:
 def terminal_value_gordon(ufcf: pd.DataFrame, wacc: float, terminal_growth: float) -> float:
     """Gordon growth model terminal value.
 
-    The terminal value assumes the firm grows at a steady rate forever after the
-    explicit forecast ends. In practice, this should be below long-run nominal GDP
-    growth and below the company's sustainable growth rate.
+    TERMINAL VALUE (Gordon Growth Model):
+    We can only forecast explicitly for 5 years. Beyond that, we assume the firm grows
+    at a constant "terminal growth rate" indefinitely. The terminal value captures
+    the value of all cash flows from year 6 onward.
+
+    Formula: TV = FCF_year6 / (WACC - g)
+    where FCF_year6 = FCF_year5 * (1 + g) and g = terminal growth rate
+
+    Key assumptions:
+    - g must be < WACC (otherwise the formula breaks down and value explodes)
+    - g should be conservative: typically 2-3%, around long-run nominal GDP growth
+    - The terminal value usually represents 60-80% of total enterprise value
+    
+    For Varex, we use 2.5% as a realistic long-term growth rate given the stable
+    industrial/medical imaging market.
     """
+    # Safety check: if growth >= WACC, the model is unstable and the value is infinite.
+    # This represents an unrealistic scenario and should be flagged.
     if wacc <= terminal_growth:
         return np.nan
+    
+    # Extrapolate year 5 cash flow to year 6, growing at the terminal rate
     year_6_fcf = float(ufcf["UFCF"].iloc[-1] * (1 + terminal_growth))
+    
+    # Gordon growth perpetuity: cash flow in year 6 divided by (WACC - growth)
+    # This assumes constant growth forever and is capitalized at the WACC spread
     tv = year_6_fcf / (wacc - terminal_growth)
     return tv
 
@@ -321,9 +405,20 @@ def terminal_value_gordon(ufcf: pd.DataFrame, wacc: float, terminal_growth: floa
 def build_exit_multiple_comps(comp_symbols: List[str]) -> pd.DataFrame:
     """Cross-check the Gordon growth TV with an EV/EBITDA exit multiple.
 
-    The idea is simple: an acquirer may pay a market multiple on the business's
-    earnings power at the point of sale. We compare Varex against relevant peers
-    to see whether the DCF terminal value is realistic.
+    EXIT MULTIPLE APPROACH (Cross-check):
+    An alternative way to estimate terminal value is to assume the company is sold at
+    a market multiple (e.g., EV/EBITDA) typical for the industry. This is a reality check:
+    if our Gordon growth terminal value implies an unrealistic exit multiple, we know
+    our assumptions are off.
+
+    Trading Comparables (Comps):
+    - GEHC (GE HealthCare): large medical imaging/healthcare IT conglomerate
+    - TDY (Teledyne): diversified electronics & imaging; acquirer of Varex
+    - Varex itself: no pure-play public comp, so GEHC/TDY serve as directional proxies
+
+    The idea: take the median EV/EBITDA from peers and apply it to Varex's terminal
+    year EBITDA. This gives us an alternative estimate of terminal value that should
+    be in the same ballpark as the Gordon growth TV.
     """
     rows = []
     for symbol in comp_symbols:
@@ -373,9 +468,23 @@ def build_exit_multiple_comps(comp_symbols: List[str]) -> pd.DataFrame:
 def estimate_value_per_share_via_dcf(symbol: str, offer_price: float = OFFER_PRICE) -> Dict[str, float]:
     """Run the full DCF and return valuation metrics.
 
+    FULL DCF WORKFLOW:
+    1. Pull financial statements (income, balance sheet, cash flow) from yfinance
+    2. Build historical metrics (margins, growth rates, working capital ratios)
+    3. Project 5-year unlevered free cash flows
+    4. Estimate WACC using CAPM (cost of equity and cost of debt)
+    5. Discount forecast period cash flows to present value
+    6. Calculate terminal value using Gordon growth model
+    7. Sum PV of forecast + PV of terminal to get enterprise value
+    8. Subtract net debt to get equity value
+    9. Divide by shares outstanding to get implied share price
+    10. Cross-check with exit multiple approach (EV/EBITDA comps)
+    11. Compare to offer price
+
     This yields a price estimate per share, which can then be compared directly
     with the acquisition offer in the deal note.
     """
+    # Step 1-3: Fetch data, build history, and project forward
     data = fetch_statement_data(symbol)
     income = data["income"]
     balance = data["balance"]
@@ -384,36 +493,54 @@ def estimate_value_per_share_via_dcf(symbol: str, offer_price: float = OFFER_PRI
     hist = build_history_metrics(income, balance, cashflow)
     forecast = build_ufcf_projection(hist, years=5)
 
+    # Step 4: Estimate WACC via CAPM
     wacc_info = estimate_capm_wacc(info, balance, income)
     wacc = float(wacc_info["wacc"])
+    # Terminal growth assumption: conservative perpetual growth rate
+    # Should be < WACC and realistic for long-term GDP + company-specific growth
     terminal_growth = 0.025
 
+    # Step 5-7: Discount cash flows and calculate enterprise value
     pv = discount_cash_flows(forecast, wacc)
+    # Terminal value is discounted back 5 years to get its present value
     pv_terminal = terminal_value_gordon(forecast, wacc, terminal_growth) / ((1 + wacc) ** 5)
+    # Total enterprise value = sum of discounted forecast period cash flows + PV of terminal value
     enterprise_value = float(pv["PV UFCF"].sum() + pv_terminal)
 
+    # Step 8: Extract net debt from balance sheet
     debt_key = pick_metric(balance, ["Total Debt", "Short Long Term Debt", "Long Term Debt", "Current Debt"])
     cash_key = pick_metric(balance, ["Cash And Cash Equivalents", "Cash", "Cash And Short Term Investments"])
     debt = latest_value(balance[debt_key]) if debt_key else 0.0
     cash = latest_value(balance[cash_key]) if cash_key else 0.0
+    # Net debt = total debt minus cash. Equity value = enterprise value - net debt
     net_debt = debt - cash
 
+    # Step 9: Get shares outstanding for per-share calculation
     shares = float(info.get("sharesOutstanding", 0.0) or 0.0)
     last_price = float(info.get("currentPrice", 0.0) or 0.0)
     if shares <= 0 and last_price > 0:
         shares = float(info.get("marketCap", 0.0) or 0.0) / last_price
 
+    # Implied share price from Gordon growth DCF: equity value / shares
     equity_value = enterprise_value - net_debt
     implied_price = equity_value / shares if shares > 0 else np.nan
 
+    # Step 10: Cross-check with exit multiple approach
     comps = build_exit_multiple_comps(COMPS)
+    # Use median EV/EBITDA from comparable companies
     exit_multiple = float(comps["EV_EBITDA"].median())
+    # Terminal year EBITDA = EBIT + D&A (operating earnings before financing and tax effects)
     terminal_ebitda = float(forecast["EBIT"].iloc[-1] + forecast["D&A"].iloc[-1])
+    # Terminal value via exit multiple = apply median comp multiple to terminal EBITDA
     tv_exit = terminal_ebitda * exit_multiple
+    # Discount terminal value back 5 years to present
     pv_exit = tv_exit / ((1 + wacc) ** 5)
+    # Enterprise value using exit multiple for terminal value
     enterprise_value_exit = float(pv["PV UFCF"].sum() + pv_exit)
+    # Implied share price via exit multiple approach
     implied_price_exit = (enterprise_value_exit - net_debt) / shares if shares > 0 else np.nan
 
+    # Step 11: Compile results for reporting
     summary = {
         "wacc": wacc,
         "terminal_growth": terminal_growth,
@@ -440,9 +567,21 @@ def estimate_value_per_share_via_dcf(symbol: str, offer_price: float = OFFER_PRI
 def make_sensitivity_heatmap(summary: Dict[str, float]) -> None:
     """Create a 2D sensitivity table for WACC vs terminal growth.
 
-    This is a classic DCF sensitivity analysis: for different required returns and
-    long-run growth rates, the implied share price changes materially. The chart
-    shows the range around the offer price clearly.
+    SENSITIVITY ANALYSIS:
+    DCF valuation depends critically on two uncertain inputs: WACC and terminal growth.
+    We vary both over a reasonable range and show how the implied share price changes.
+
+    This table shows:
+    - Rows: WACC (4% to 12%), representing different risk/discount-rate scenarios
+    - Columns: Terminal growth (1% to 5%), representing different perpetual growth rates
+    - Cells: Implied share price for that WACC/growth combination
+
+    The offer price ($18.90) is marked so you can see how many scenarios justify
+    or reject the deal. A wide range implies high sensitivity; a narrow range means
+    the valuation is relatively robust to assumption changes.
+    
+    This is critical for interview discussion: you want to show how confident you are
+    in your base case and what would need to change for the deal to look different.
     """
     data = fetch_statement_data(TICKER)
     hist = build_history_metrics(data["income"], data["balance"], data["cashflow"])
@@ -464,11 +603,17 @@ def make_sensitivity_heatmap(summary: Dict[str, float]) -> None:
     for i, wacc in enumerate(wacc_grid):
         pv = discount_cash_flows(forecast, wacc)
         for j, g in enumerate(growth_grid):
+            # Calculate Gordon growth terminal value for this (WACC, growth) pair
             tv = terminal_value_gordon(forecast, wacc, g)
             if np.isnan(tv):
+                # If terminal growth >= WACC, the scenario is unrealistic; mark as NaN
                 values[i, j] = np.nan
                 continue
+            # Enterprise value = PV of explicit forecast + PV of terminal value
+            # Terminal value is discounted back 5 years to present
             ev = pv["PV UFCF"].sum() + tv / ((1 + wacc) ** 5)
+            # Equity value = enterprise value - net debt
+            # Share price = equity value / shares outstanding
             values[i, j] = (ev - net_debt) / shares
 
     plt.figure(figsize=(9, 7))
@@ -525,11 +670,16 @@ def make_implied_value_chart(summary: Dict[str, float]) -> None:
 
 
 def main() -> None:
-    """Run the full valuation workflow and save clean outputs."""
+    """Run the full valuation workflow and save clean outputs.
+    
+    This is the entry point: fetch data, build the DCF model, run sensitivity analysis,
+    and save charts and summaries for presentation.
+    """
+    # Run the full DCF valuation
     summary = estimate_value_per_share_via_dcf(TICKER, OFFER_PRICE)
 
-    # Save the DCF summary in CSV format so the key outputs are easy to inspect or
-    # present in an interview slide.
+    # Compile key metrics into a CSV for easy inspection and presentation
+    # This table shows all the critical WACC components and valuation outputs.
     summary_table = pd.DataFrame([
         {
             "Metric": "WACC",
@@ -574,7 +724,9 @@ def main() -> None:
     ])
     summary_table.to_csv(OUTPUT_DIR / "vrex_dcf_summary.csv", index=False)
 
+    # Generate sensitivity heatmap: shows how implied value changes with WACC and terminal growth
     make_sensitivity_heatmap(summary)
+    # Generate value comparison chart: DCF value, exit multiple value, and offer price side-by-side
     make_implied_value_chart(summary)
 
     print("WACC:", round(summary["wacc"], 4))
@@ -585,10 +737,20 @@ def main() -> None:
     print("Upside vs offer:", round(summary["upside_vs_offer"] * 100, 2), "%")
     print("Comparable EV/EBITDA median:", round(summary["exit_multiple"], 2), "x")
 
-    print("\nNotes:")
-    print("- Varex does not have a clean pure-play public comp; GEHC and TDY are used only as directional cross-checks.")
-    print("- The sensitivity heatmap and value charts were saved in the output folder.")
+    print("\n" + "="*70)
+    print("INTERPRETATION NOTES:")
+    print("="*70)
+    print("- Varex does not have a clean pure-play public comp; GEHC and TDY are used")
+    print("  only as directional cross-checks for valuation multiples.")
+    print("- Terminal value represents perpetual growth beyond year 5 and is the largest")
+    print("  driver of valuation; small changes in terminal growth rate have large effects.")
+    print("- The sensitivity heatmap shows which WACC/growth combinations justify or")
+    print("  reject the $18.90 offer. Interpret this in context of your confidence in")
+    print("  the cost of capital and long-term growth assumptions.")
+    print("- Charts and CSV saved in output/ for presentation.")
+    print("="*70)
 
 
 if __name__ == "__main__":
+    # Execute the valuation workflow
     main()
